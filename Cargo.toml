@@ -17,7 +17,6 @@ include = [ "src", "internal" ]
 [badges]
 # See https://doc.rust-lang.org/cargo/reference/manifest.html#the-badges-section
 github = { repository = "enarx/enarx-keepldr", workflow = "test" }
-#github = { repository = "enarx/enarx-keepldr", workflow = "lint" }
 maintenance = { status = "actively-developed" }
 is-it-maintained-issue-resolution = { repository = "enarx/enarx-keepldr" }
 is-it-maintained-open-issues = { repository = "enarx/enarx-keepldr" }
