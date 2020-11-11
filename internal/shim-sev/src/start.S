@@ -101,58 +101,70 @@ SevExit:
 
     // Setup the pagetables
     // done dynamically, otherwise we would have to correct the dynamic symbols twice
+
+    // setup PDPT_OFFSET in PML4T table
     lea     rax,    [rip + PML4T]
     lea     rbx,    [rip + PDPT_OFFSET]
-    // set C-bit
-    or      rbx,    r12
-    // (WRITABLE | PRESENT)
-    or      rbx,    0x3
+    or      rbx,    r12         // set C-bit
+    or      rbx,    0x3         // (WRITABLE | PRESENT)
     mov     QWORD PTR [rax + (((SHIM_OFFSET & 0xFFFFFFFFFFFF) >> 39)*8)],   rbx
 
-    // set C-bit in PDPT_OFFSET table
+    // set C-bit in all entries of the PDT_OFFSET table
+    lea     rbx,    [rip + PDT_OFFSET]
+    mov     rdx,    r11
+    mov     ecx,    512         // Counter to 512 page table entries
+    add     rbx,    4           // Pre-advance pointer by 4 bytes for the higher 32bit
+setCBit_PDT_OFFSET:
+    mov     DWORD PTR [rbx],    edx
+    add     rbx,    8           // advance pointer by 8
+    loop    setCBit_PDT_OFFSET
+
+    // set C-bit in all entries of the PDPT_OFFSET table
     lea     rbx,    [rip + PDPT_OFFSET]
     mov     rdx,    r11
-    // Counter to 512 page table entries
-    mov     ecx,    512
-    // Pre-advance pointer by 4 bytes for the higher 32bit
-    add     rbx,    4
-
-setCBit:
+    mov     ecx,    512         // Counter to 512 page table entries
+    add     rbx,    4           // Pre-advance pointer by 4 bytes for the higher 32bit
+setCBit_PDPT_OFFSET:
     mov     DWORD PTR [rbx],    edx
-    // advance pointer by 8
-    add     rbx,    8
-    loop    setCBit
+    add     rbx,    8           // advance pointer by 8
+    loop    setCBit_PDPT_OFFSET
 
-    // set C-bit in PDT_IDENT table
+    // setup PDPT_OFFSET table entry 0 with PDT_OFFSET table
+    lea     rbx,    [rip + PDPT_OFFSET]
+    lea     rcx,    [rip + PDT_OFFSET]
+    or      rcx,    r12         // set C-bit
+    or      rcx,    0x3         // ( WRITABLE | PRESENT)
+    // store PDT_OFFSET table in PDPT_OFFSET in the correct slot
+    // 0x0 - 0x4000_0000
+    mov     QWORD PTR [rbx],    rcx
+
+    // set C-bit for the first 3 entries in the PDT_IDENT table
     lea     rcx,    [rip + PDT_IDENT]
     mov     rdx,    r11
+    mov     DWORD PTR [rcx + (0*8 + 4)],    edx
     mov     DWORD PTR [rcx + (1*8 + 4)],    edx
     mov     DWORD PTR [rcx + (2*8 + 4)],    edx
 
-    // setup PDPT_IDENT table
+    // setup PDPT_IDENT table entry 0 with PDT_IDENT table
     lea     rbx,    [rip + PDPT_IDENT]
-    // set C-bit
-    or      rcx,    r12
-    // ( WRITABLE | PRESENT)
-    or      rcx,    0x3
+    or      rcx,    r12         // set C-bit
+    or      rcx,    0x3         // ( WRITABLE | PRESENT)
     // store PDT_IDENT table in PDPT_IDENT in the correct slot
     // 0x0 - 0x4000_0000
     mov     QWORD PTR [rbx],    rcx
 
-    // set C-bit
-    or      rbx,    r12
-    // ( WRITABLE | PRESENT)
-    or      rbx,    0x3
-
+    // setup PDPT_IDENT in PML4T table
+    or      rbx,    r12         // set C-bit
+    or      rbx,    0x3         // ( WRITABLE | PRESENT)
     lea     rax,    [rip + PML4T]
     mov     QWORD PTR [rax],    rbx
 
-    or      rax,    r12
+    or      rax,    r12         // set C-bit for new CR3
     mov     cr3,    rax
 
+    // advance rip to kernel address space with SHIM_OFFSET
     lea     rax,    [rip + _trampoline]
     mov     rbx,    SHIM_OFFSET
-
     adox    rax,    rbx
     jmp     rax
 
@@ -166,7 +178,7 @@ _trampoline:
     // load stack in shim virtual address space
     lea     rsp,    [rip + _initial_shim_stack]
     // sub 8 because we push 8 bytes later and want 16 bytes align
-    add     rsp,    (SIZE_OF_INITIAL_STACK-8)
+    add     rsp,    SIZE_OF_INITIAL_STACK
 
     // save arg1
     push    rdi
@@ -182,75 +194,15 @@ _trampoline:
     pop     rdi
 
     // set arg2 to SEV C-Bit mask
-    mov     rsi,r12
-    xor     rbp,rbp
+    mov     rsi,    r12
+    xor     rbp,    rbp
 
-    // jump to _start_main
+    // call _start_main
     // arg1 %rdi  = address of SYSCALL_PAGE (boot_info)
     // arg2 %rsi  = SEV C-bit mask
-    jmp     _start_main
+    call    _start_main
 
 .section .bss
 .align 4096
 _initial_shim_stack:
 .space SIZE_OF_INITIAL_STACK
-
-//
-// // Page Tables:
-//
-// * PDPT_IDENT: an identity mapped one for 0x0 - 0x40_0000
-// * PDPT_OFFSET: an offset page table with offset $SHIM_OFFSET
-
-// The root table of the 4-Level Paging
-// Intel Vol 3A - 4.5
-// will contain:
-//       [0] PDPT_IDENT:  0x0                   - 0x80_0000_0000
-// [1..=510] empty for now
-//     [511] PDPT_OFFSET: 0xFFFF_FF80_0000_0000 - 0xFFFF_FFFF_FFFF_FFFF
-.section .bss
-.align  4096
-PML4T:
-.space 4096
-
-// Offset Page-Directory-Pointer Table
-// with pointers to Huge Pages, mapping 38bit of addresses to
-// SHIM_OFFSET + x, making the translation of shim virtual address space
-// to physical address space easy, by substracting SHIM_OFFSET.
-// This also enables mapping user space below SHIM_OFFSET and use the same
-// CR3 for shim and user space.
-.section .data
-.align  4096
-.att_syntax
-PDPT_OFFSET:
-// helper macro to calculate PDPT_OFFSET entries
-.macro  QUAD from,count,step
-.set    offset,0
-.rept   \count
-.quad   (\from + offset)
-.set    offset,offset+\step
-.endr
-.endm
-// fill in PDPT_OFFSET entries with 0x83 flags (HUGE_PAGE | WRITABLE | PRESENT)
-// and calculated offsets
-QUAD    0x83,512,0x40000000
-
-// Identity Page-Directory-Pointer Table
-// will contain a pointer to a Identity Page-Directory Table
-//      [0] PDT_IDENT:  0x0                   - 0x4000_0000
-// [1..512] empty for now
-.section .bss
-.align  4096
-PDPT_IDENT:
-.space  4096
-
-// Identity Page-Directory Table
-// with 2 pointers to 2MB Huge Pages
-//  [0..=1] 0x0 - 0x40_0000
-// [1..512] empty for now
-.section .data
-.align  4096
-PDT_IDENT:
-.quad   0x000083  // 0x00_0000 - 0x20_0000 (HUGE_PAGE | WRITABLE | PRESENT)
-.quad   0x200083  // 0x20_0000 - 0x40_0000 (HUGE_PAGE | WRITABLE | PRESENT)
-.quad   0x400083  // 0x40_0000 - 0x60_0000 (HUGE_PAGE | WRITABLE | PRESENT)
-.space  4072

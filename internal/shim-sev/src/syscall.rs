@@ -3,19 +3,29 @@
 //! syscall interface layer between assembler and rust
 
 use crate::addr::{HostVirtAddr, ShimPhysUnencryptedAddr};
+use crate::asm::_enarx_asm_triple_fault;
 use crate::eprintln;
 use crate::frame_allocator::FRAME_ALLOCATOR;
-use crate::hostcall::{self, shim_write_all, HostFd, HOST_CALL};
+use crate::hostcall::{self, HostCall, HOST_CALL};
 use crate::paging::SHIM_PAGETABLE;
 use crate::payload::{NEXT_BRK_RWLOCK, NEXT_MMAP_RWLOCK};
 use core::convert::TryFrom;
-use core::mem::{size_of, MaybeUninit};
+use core::mem::size_of;
 use core::ops::{Deref, DerefMut};
-use primordial::Address;
-use sallyport::request;
-use x86_64::registers::wrfsbase;
+use primordial::{Address, Register};
+use sallyport::{Cursor, Request};
+use spinning::MutexGuard;
+use syscall::{SyscallHandler, ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_FS, ARCH_SET_GS, SEV_TECH};
+use untrusted::{AddressValidator, UntrustedRef, UntrustedRefMut, Validate};
+use x86_64::registers::{rdfsbase, rdgsbase, wrfsbase, wrgsbase};
 use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 use x86_64::{align_up, VirtAddr};
+
+#[repr(C)]
+struct X8664DoubleReturn {
+    rax: u64,
+    rdx: u64,
+}
 
 /// syscall service routine
 ///
@@ -42,7 +52,9 @@ pub unsafe fn _syscall_enter() -> ! {
     push   r11                                        # push RFLAGS stored in r11
     push   {3}
     push   rcx                                        # push userspace return pointer
-    swapgs                                            # restore gs
+
+    push   rbx
+    mov    rbx, rsp
 
     # Arguments in registers:
     # SYSV:    rdi, rsi, rdx, rcx, r8, r9
@@ -53,7 +65,6 @@ pub unsafe fn _syscall_enter() -> ! {
     push   rdi
     push   rsi
     push   rdx
-    push   rcx
     push   r11
     push   r10
     push   r8
@@ -72,10 +83,13 @@ pub unsafe fn _syscall_enter() -> ! {
     pop    r8
     pop    r10
     pop    r11
-    pop    rcx
-    pop    rdx
+    add    rsp,                     0x8               # skip rdx
     pop    rsi
     pop    rdi
+
+    pop    rbx
+
+    swapgs                                            # restore gs
 
     iretq
     ",
@@ -88,199 +102,162 @@ pub unsafe fn _syscall_enter() -> ! {
     );
 }
 
-#[allow(clippy::many_single_char_names)]
-#[no_mangle]
 /// Handle a syscall in rust
-pub extern "C" fn syscall_rust(
-    a: usize,
-    b: usize,
-    c: usize,
-    d: usize,
-    e: usize,
-    f: usize,
+#[allow(clippy::many_single_char_names)]
+extern "sysv64" fn syscall_rust(
+    a: Register<usize>,
+    b: Register<usize>,
+    c: Register<usize>,
+    d: Register<usize>,
+    e: Register<usize>,
+    f: Register<usize>,
     nr: usize,
-) -> usize {
-    /*
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "SC> raw: syscall({}, {:#X}, {:#X}, {:#X}, {}, {}, {:#X})",
-            nr, a, b, c, d, e, f
-        );
-    */
+) -> X8664DoubleReturn {
+    let orig_rdx: usize = c.into();
 
-    let h = Handler::new(a, b, c, d, e, f);
-
-    let res = match nr as i64 {
-        libc::SYS_exit => h.exit(),
-        libc::SYS_exit_group => h.exit_group(),
-        libc::SYS_read => h.read(),
-        libc::SYS_readv => h.readv(),
-        libc::SYS_write => h.write(),
-        libc::SYS_writev => h.writev(),
-        libc::SYS_mmap => h.mmap(),
-        libc::SYS_munmap => h.munmap(),
-        libc::SYS_arch_prctl => h.arch_prctl(),
-        libc::SYS_set_tid_address => h.set_tid_address(),
-        libc::SYS_rt_sigaction => h.rt_sigaction(),
-        libc::SYS_rt_sigprocmask => h.rt_sigprocmask(),
-        libc::SYS_sigaltstack => h.sigaltstack(),
-        libc::SYS_getrandom => h.getrandom(),
-        libc::SYS_brk => h.brk(),
-        libc::SYS_ioctl => h.ioctl(),
-        libc::SYS_mprotect => h.mprotect(),
-        libc::SYS_clock_gettime => h.clock_gettime(),
-        libc::SYS_uname => h.uname(),
-        libc::SYS_readlink => h.readlink(),
-        libc::SYS_fstat => h.fstat(),
-        libc::SYS_fcntl => h.fcntl(),
-        libc::SYS_madvise => h.madvise(),
-        libc::SYS_poll => h.poll(),
-
-        syscall => {
-            //panic!("SC> unsupported syscall: {}", syscall);
-            eprintln!("SC> unsupported syscall: {}", syscall);
-            Err(libc::ENOSYS)
-        }
+    let mut h = Handler {
+        hostcall: None,
+        argv: [a.into(), b.into(), c.into(), d.into(), e.into(), f.into()],
     };
-    res.unwrap_or_else(|e| e.checked_neg().unwrap() as usize) as usize
+
+    let ret = h.syscall(a, b, c, d, e, f, nr);
+
+    match ret {
+        Err(e) => X8664DoubleReturn {
+            rax: e.checked_neg().unwrap() as _,
+            // Preserve `rdx` as it is normally not clobbered with a syscall
+            rdx: orig_rdx as _,
+        },
+        Ok([rax, rdx]) => X8664DoubleReturn {
+            rax: rax.into(),
+            rdx: rdx.into(),
+        },
+    }
 }
 
+/// FIXME
 struct Handler {
-    a: usize,
-    b: usize,
-    c: usize,
-    d: usize,
-    e: usize,
-    f: usize,
+    hostcall: Option<MutexGuard<'static, HostCall<'static>>>,
+    argv: [usize; 6],
 }
 
-impl Handler {
-    #[allow(clippy::many_single_char_names)]
-    pub fn new(a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) -> Self {
-        Self { a, b, c, d, e, f }
-    }
-    pub fn exit(&self) -> ! {
-        eprintln!("SC> exit({})", self.a);
-        hostcall::shim_exit(self.a as _);
+impl AddressValidator for Handler {
+    #[inline(always)]
+    fn validate_const_mem_fn(&self, _ptr: *const (), _size: usize) -> bool {
+        // FIXME: https://github.com/enarx/enarx/issues/630
+        true
     }
 
-    pub fn exit_group(&self) -> ! {
-        eprintln!("SC> exit_group({})", self.a);
-        hostcall::shim_exit(self.a as _);
+    #[inline(always)]
+    fn validate_mut_mem_fn(&self, _ptr: *mut (), _size: usize) -> bool {
+        // FIXME: https://github.com/enarx/enarx/issues/630
+        true
+    }
+}
+
+impl SyscallHandler for Handler {
+    unsafe fn proxy(&mut self, req: Request) -> sallyport::Result {
+        let block = self
+            .hostcall
+            .get_or_insert_with(|| HOST_CALL.try_lock().unwrap())
+            .as_mut_block();
+        block.msg.req = req;
+        self.hostcall
+            .get_or_insert_with(|| HOST_CALL.try_lock().unwrap())
+            .hostcall()
     }
 
-    fn _read(&self, fd: usize, data: *mut u8, len: usize) -> Result<usize, libc::c_int> {
-        let mut host_call = HOST_CALL.try_lock().ok_or(libc::EIO)?;
+    fn attacked(&mut self) -> ! {
+        // provoke triple fault, causing a VM shutdown
+        unsafe { _enarx_asm_triple_fault() };
+    }
 
-        let trusted: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(data, len) };
-
-        let block = host_call.as_mut_block();
-
-        let c = block.cursor();
-        let (_, buf) = unsafe { c.alloc::<u8>(trusted.len()).or(Err(libc::EMSGSIZE))? };
-
-        let buf_address = Address::from(buf.as_ptr());
+    fn translate_shim_to_host_addr<T>(&self, buf: *const T) -> *const T {
+        let buf_address = Address::from(buf);
         let phys_unencrypted = ShimPhysUnencryptedAddr::try_from(buf_address).unwrap();
-        let host_virt: HostVirtAddr<_> = phys_unencrypted.into();
+        Register::<usize>::from(HostVirtAddr::from(phys_unencrypted)).into()
+    }
 
-        block.msg.req = request!(libc::SYS_read => fd, host_virt, len);
-        let result = unsafe { host_call.hostcall() };
-        let result_len: usize = result.map(|r| r[0].into())?;
+    fn new_cursor(&mut self) -> Cursor {
+        self.hostcall
+            .get_or_insert_with(|| HOST_CALL.try_lock().unwrap())
+            .as_mut_block()
+            .cursor()
+    }
 
-        if trusted.len() < result_len {
-            panic!("syscall read buffer overflow");
+    fn trace(&mut self, name: &str, argc: usize) {
+        eprint!("{}(", name);
+        for (i, arg) in self.argv[..argc].iter().copied().enumerate() {
+            let prefix = if i > 0 { ", " } else { "" };
+            eprint!("{}{:#x}", prefix, arg);
         }
 
-        let block = host_call.as_mut_block();
-        let c = block.cursor();
-        let (_, untrusted) = unsafe { c.alloc(result_len).or(Err(libc::EMSGSIZE))? };
-        trusted[..result_len].copy_from_slice(untrusted);
-
-        Ok(result_len)
+        eprintln!(")");
     }
 
-    pub fn read(&self) -> Result<usize, libc::c_int> {
-        self._read(self.a, self.b as *mut u8, self.c)
+    fn get_attestation(&mut self) -> sallyport::Result {
+        self.trace("get_att", 0);
+        Ok([0.into(), SEV_TECH.into()])
     }
 
-    pub fn readv(&self) -> Result<usize, libc::c_int> {
-        let iovec =
-            unsafe { core::slice::from_raw_parts_mut(self.b as *mut libc::iovec, self.c as usize) };
-
-        // FIXME: this is not an ideal implementation of readv, but for the sake
-        // of simplicity this readv implementation behaves very much like how the
-        // Linux kernel would for a module that does not support readv, but does
-        // support read.
-        let mut read = 0usize;
-        for vec in iovec {
-            let r = self._read(self.a, vec.iov_base as *mut u8, vec.iov_len as usize)?;
-            read = read.checked_add(r).unwrap();
-        }
-
-        Ok(read)
+    fn exit(&mut self, status: i32) -> ! {
+        self.trace("exit", 1);
+        hostcall::shim_exit(status);
     }
 
-    pub fn write(&self) -> Result<usize, libc::c_int> {
-        let fd = self.a;
-        let data = self.b as *const u8;
-        let len = self.c;
-        let mut host_call = HOST_CALL.try_lock().ok_or(libc::EIO)?;
-        unsafe {
-            let slice = core::slice::from_raw_parts(data, len);
-            // FIXME: allocate unencrypted pages
-            host_call.write(fd, slice).map(|r| r[0].into())
-        }
+    fn exit_group(&mut self, status: i32) -> ! {
+        self.trace("exit_group", 1);
+        hostcall::shim_exit(status);
     }
 
-    pub fn writev(&self) -> Result<usize, libc::c_int> {
-        let fd = unsafe { HostFd::from_raw_fd(self.a as _) };
-        let iovec =
-            unsafe { core::slice::from_raw_parts_mut(self.b as *mut libc::iovec, self.c as usize) };
-        let bufsize = iovec
-            .iter()
-            .fold(0, |a: usize, e| a.checked_add(e.iov_len).unwrap());
-
-        for vec in iovec {
-            let data = unsafe {
-                core::slice::from_raw_parts(vec.iov_base as *const u8, vec.iov_len as usize)
-            };
-            // FIXME: allocate unencrypted pages
-            shim_write_all(fd, data)?;
-        }
-        Ok(bufsize)
-    }
-
-    pub fn arch_prctl(&self) -> Result<usize, libc::c_int> {
-        const ARCH_SET_GS: usize = 0x1001;
-        const ARCH_SET_FS: usize = 0x1002;
-        const ARCH_GET_FS: usize = 0x1003;
-        const ARCH_GET_GS: usize = 0x1004;
-
-        match self.a {
+    fn arch_prctl(&mut self, code: i32, addr: u64) -> sallyport::Result {
+        self.trace("arch_prctl", 2);
+        match code {
             ARCH_SET_FS => {
-                let value: u64 = self.b as _;
+                // FIXME: check `addr` value
                 unsafe {
-                    wrfsbase(value);
+                    wrfsbase(addr);
                 }
-                eprintln!("SC> arch_prctl(ARCH_SET_FS, {:#X}) = 0", value);
-                Ok(0)
+                eprintln!("SC> arch_prctl(ARCH_SET_FS, {:#x}) = 0", addr);
+                Ok(Default::default())
             }
-            ARCH_GET_FS => unimplemented!(),
-            ARCH_SET_GS => unimplemented!(),
-            ARCH_GET_GS => unimplemented!(),
+            ARCH_GET_FS => {
+                let addr = UntrustedRefMut::from(addr as *mut libc::c_ulong);
+                let addr = addr.validate(self).ok_or(libc::EFAULT)?;
+                unsafe {
+                    *addr = rdfsbase();
+                }
+                Ok(Default::default())
+            }
+            ARCH_SET_GS => {
+                // FIXME: check `addr` value
+                unsafe {
+                    wrgsbase(addr);
+                }
+                eprintln!("SC> arch_prctl(ARCH_SET_GS, {:#x}) = 0", addr);
+                Ok(Default::default())
+            }
+            ARCH_GET_GS => {
+                let addr = UntrustedRefMut::from(addr as *mut libc::c_ulong);
+                let addr = addr.validate(self).ok_or(libc::EFAULT)?;
+                unsafe {
+                    *addr = rdgsbase();
+                }
+                Ok(Default::default())
+            }
             x => {
-                eprintln!("SC> arch_prctl({:#X}, {:#X}) = -EINVAL", x, self.b);
+                eprintln!("SC> arch_prctl({:#x}, {:#x}) = -EINVAL", x, addr);
                 Err(libc::EINVAL)
             }
         }
     }
 
-    pub fn mprotect(&self) -> Result<usize, libc::c_int> {
+    fn mprotect(&mut self, addr: UntrustedRef<u8>, len: usize, prot: i32) -> sallyport::Result {
+        self.trace("mprotect", 3);
+        let addr = addr.as_ptr();
+
         use x86_64::structures::paging::mapper::Mapper;
 
-        let addr = self.a as u64;
-        let len = self.b;
-        let prot = self.c as i32;
         let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
 
         if prot & libc::PROT_WRITE != 0 {
@@ -293,7 +270,7 @@ impl Handler {
 
         let mut page_table = SHIM_PAGETABLE.write();
 
-        let start_addr = VirtAddr::new(addr);
+        let start_addr = VirtAddr::from_ptr(addr);
         let start_page: Page = Page::containing_address(start_addr);
         let end_page: Page = Page::containing_address(start_addr + len - 1u64);
         let page_range = Page::range_inclusive(start_page, end_page);
@@ -303,31 +280,34 @@ impl Handler {
                     Ok(flush) => flush.flush(),
                     Err(e) => {
                         eprintln!(
-                            "SC> mprotect({:#X}, {}, {}, …) = EINVAL ({:#?})",
-                            self.a, self.b, self.c, e
+                            "SC> mprotect({:#?}, {}, {}, …) = EINVAL ({:#?})",
+                            addr, len, prot, e
                         );
                         return Err(libc::EINVAL);
                     }
                 }
             }
         }
-        eprintln!("SC> mprotect({:#X}, {}, {}, …) = 0", self.a, self.b, self.c);
+        eprintln!("SC> mprotect({:#?}, {}, {}, …) = 0", addr, len, prot);
 
-        Ok(0)
+        Ok(Default::default())
     }
 
-    pub fn mmap(&self) -> Result<usize, libc::c_int> {
+    fn mmap(
+        &mut self,
+        addr: UntrustedRef<u8>,
+        length: usize,
+        prot: i32,
+        flags: i32,
+        fd: i32,
+        offset: i64,
+    ) -> sallyport::Result {
+        self.trace("mmap", 6);
+
         const PA: i32 = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
 
-        let addr = self.a;
-        let len = self.b;
-        let prot = self.c as i32;
-        let flags = self.d as i32;
-        let fd = self.e as i32;
-        let offset = self.f;
-
-        match (addr, len, prot, flags, fd, offset) {
-            (0, _, _, PA, -1, 0) => {
+        match (addr.as_ptr(), length, prot, flags, fd, offset) {
+            (ptr, _, _, PA, -1, 0) if ptr.is_null() => {
                 let mut flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
 
                 if prot & libc::PROT_WRITE != 0 {
@@ -339,7 +319,7 @@ impl Handler {
                 }
 
                 let virt_addr = *NEXT_MMAP_RWLOCK.read().deref();
-                let len_aligned = align_up(len as _, Page::<Size4KiB>::SIZE) as _;
+                let len_aligned = align_up(length as _, Page::<Size4KiB>::SIZE) as _;
 
                 let mem_slice = FRAME_ALLOCATOR
                     .write()
@@ -353,60 +333,62 @@ impl Handler {
                             | PageTableFlags::USER_ACCESSIBLE,
                     )
                     .map_err(|_| {
-                        eprintln!("SC> mmap({:#X}, {}, …) = ENOMEM", self.a, self.b,);
+                        eprintln!("SC> mmap(0, {}, …) = ENOMEM", length);
                         libc::ENOMEM
                     })?;
-                eprintln!(
-                    "SC> mmap({:#X}, {}, …) = {:#?}",
-                    self.a,
-                    self.b,
-                    mem_slice.as_ptr()
-                );
+                eprintln!("SC> mmap(0, {}, …) = {:#?}", length, mem_slice.as_ptr());
                 unsafe {
-                    core::ptr::write_bytes(mem_slice.as_mut_ptr(), 0, len);
+                    core::ptr::write_bytes(mem_slice.as_mut_ptr(), 0, length);
                 }
                 *NEXT_MMAP_RWLOCK.write().deref_mut() = virt_addr + (len_aligned as u64);
 
-                //eprintln!("next_mmap = {:#X}", *NEXT_MMAP_RWLOCK::read().deref());
+                //eprintln!("next_mmap = {:#x}", *NEXT_MMAP_RWLOCK::read().deref());
 
-                Ok(mem_slice.as_ptr() as usize)
+                Ok([mem_slice.as_ptr().into(), Default::default()])
             }
-            _ => {
-                eprintln!("SC> mmap({:#X}, {}, …)", self.a, self.b);
-                todo!();
+            (addr, ..) => {
+                eprintln!("SC> mmap({:#?}, {}, …)", addr, length);
+                unimplemented!()
             }
         }
     }
 
-    pub fn brk(&self) -> Result<usize, libc::c_int> {
+    fn munmap(&mut self, _addr: UntrustedRef<u8>, _lenght: usize) -> sallyport::Result {
+        self.trace("munmap", 2);
+        Ok(Default::default())
+    }
+
+    fn brk(&mut self, addr: *const u8) -> sallyport::Result {
+        self.trace("brk", 1);
         let len;
 
         let next_brk = *NEXT_BRK_RWLOCK.read().deref();
         let virt_addr = next_brk;
 
-        match self.a {
+        match addr as usize {
             0 => {
-                eprintln!("SC> brk({:#X}) = {:#X}", self.a, next_brk.as_u64());
-                Ok(next_brk.as_u64() as _)
+                eprintln!("SC> brk({:#?}) = {:#x}", addr, next_brk.as_u64());
+                Ok([next_brk.as_u64().into(), Default::default()])
             }
             n => {
                 if n <= next_brk.as_u64() as usize {
-                    if n as u64
-                        > next_brk
-                            .as_u64()
-                            .checked_sub(Page::<Size4KiB>::SIZE)
-                            .unwrap()
+                    if n > (next_brk
+                        .as_u64()
+                        .checked_sub(Page::<Size4KiB>::SIZE)
+                        .unwrap() as usize)
                     {
                         // already mapped
-                        eprintln!("SC> brk({:#X}) = {:#X}", self.a, n);
-                        return Ok(n);
-                    } else {
-                        // n most likely wrong
-                        return Err(libc::EINVAL);
+                        eprintln!("SC> brk({:#?}) = {:#x}", addr, n);
+                        return Ok([n.into(), Default::default()]);
                     }
+
+                    // n most likely wrong
+                    return Err(libc::EINVAL);
                 }
 
-                len = n.checked_sub(next_brk.as_u64() as usize).unwrap();
+                len = n
+                    .checked_sub(next_brk.as_u64() as usize)
+                    .ok_or(libc::EINVAL)?;
                 let len_aligned = align_up(len as _, Page::<Size4KiB>::SIZE) as _;
                 let _ = FRAME_ALLOCATOR
                     .write()
@@ -422,334 +404,26 @@ impl Handler {
                             | PageTableFlags::USER_ACCESSIBLE,
                     )
                     .map_err(|_| {
-                        eprintln!("SC> brk({:#X}) = ENOMEM", self.a);
+                        eprintln!("SC> brk({:#?}) = ENOMEM", addr);
                         libc::ENOMEM
                     })?;
 
                 *NEXT_BRK_RWLOCK.write() = virt_addr + (len_aligned as u64);
 
-                eprintln!("SC> brk({:#X}) = {:#X}", self.a, n);
+                eprintln!("SC> brk({:#?}) = {:#x}", addr, n);
 
-                Ok(n)
+                Ok([n.into(), Default::default()])
             }
         }
     }
 
-    /// Do a ioctl() syscall
-    ///
-    pub fn ioctl(&self) -> Result<usize, libc::c_int> {
-        match (self.a as i32, self.b as i32) {
-            (libc::STDIN_FILENO, libc::TIOCGWINSZ)
-            | (libc::STDOUT_FILENO, libc::TIOCGWINSZ)
-            | (libc::STDERR_FILENO, libc::TIOCGWINSZ) => {
-                // the keep has no tty
-                eprintln!("SC> ioctl({}, TIOCGWINSZ, … = -ENOTTY", self.a);
-                Err(libc::ENOTTY)
-            }
-            (libc::STDIN_FILENO, _) | (libc::STDOUT_FILENO, _) | (libc::STDERR_FILENO, _) => {
-                eprintln!("SC> ioctl({}, {}), … = -EINVAL", self.a, self.b);
-                Err(libc::EINVAL)
-            }
-            _ => {
-                eprintln!("SC> ioctl({}, {}), … = -EBADFD", self.a, self.b);
-                Err(libc::EBADFD)
-            }
-        }
-    }
-    /// Do a set_tid_address() syscall
-    ///
-    /// This is currently unimplemented and returns a dummy thread id.
-    pub fn set_tid_address(&self) -> Result<usize, libc::c_int> {
-        // FIXME
-        eprintln!("SC> set_tid_address(…) = 1");
-        Ok(1)
-    }
-
-    /// Do a rt_sigaction() syscall
-    ///
-    /// This is currently unimplemented and returns success.
-    pub fn rt_sigaction(&self) -> Result<usize, libc::c_int> {
-        // FIXME
-        eprintln!("SC> rt_sigaction(…) = 0");
-        Ok(0)
-    }
-
-    /// Do a rt_sigaction() syscall
-    ///
-    /// This is currently unimplemented and returns success.
-    pub fn rt_sigprocmask(&self) -> Result<usize, libc::c_int> {
-        // FIXME
-        eprintln!("SC> rt_sigprocmask(…) = 0");
-        Ok(0)
-    }
-
-    /// Do a munmap() syscall
-    ///
-    /// This is currently unimplemented and returns success.
-    pub fn munmap(&self) -> Result<usize, libc::c_int> {
-        // FIXME
-        eprintln!("SC> munmap(…) = 0");
-        Ok(0)
-    }
-
-    /// Do a sigaltstack() syscall
-    ///
-    /// This is currently unimplemented and returns success.
-    pub fn sigaltstack(&self) -> Result<usize, libc::c_int> {
-        // FIXME
-        eprintln!("SC> sigaltstack(…) = 0");
-        Ok(0)
-    }
-
-    /// Do a getrandom() syscall
-    pub fn getrandom(&self) -> Result<usize, libc::c_int> {
-        let flags = self.c as u64;
-        let flags = flags & !((libc::GRND_NONBLOCK | libc::GRND_RANDOM) as u64);
-
-        if flags != 0 {
-            return Err(libc::EINVAL);
-        }
-
-        let trusted =
-            unsafe { core::slice::from_raw_parts_mut(self.a as *mut u8, self.b as usize) };
-
-        for (i, chunk) in trusted.chunks_mut(8).enumerate() {
-            let mut el = 0u64;
-            loop {
-                if unsafe { core::arch::x86_64::_rdrand64_step(&mut el) } == 1 {
-                    chunk.copy_from_slice(&el.to_ne_bytes()[..chunk.len()]);
-                    break;
-                } else {
-                    if (flags & libc::GRND_NONBLOCK as u64) != 0 {
-                        eprintln!("SC> getrandom(…) = -EAGAIN");
-                        return Err(libc::EAGAIN);
-                    }
-                    if (flags & libc::GRND_RANDOM as u64) != 0 {
-                        eprintln!("SC> getrandom(…) = {}", i.checked_mul(8).unwrap());
-                        return Ok(i.checked_mul(8).unwrap());
-                    }
-                }
-            }
-        }
-        eprintln!("SC> getrandom(…) = {}", trusted.len());
-
-        Ok(trusted.len())
-    }
-
-    pub fn clock_gettime(&self) -> Result<usize, libc::c_int> {
-        let clk_id = self.a;
-        let trusted = self.b as *mut libc::timespec;
-
-        let mut host_call = HOST_CALL.try_lock().ok_or(libc::EIO)?;
-
-        let block = host_call.as_mut_block();
-
-        let c = block.cursor();
-        let (_, buf) = unsafe { c.alloc::<libc::timespec>(1).or(Err(libc::EMSGSIZE))? };
-
-        let buf_address = Address::from(buf.as_ptr());
-        let phys_unencrypted = ShimPhysUnencryptedAddr::try_from(buf_address).unwrap();
-        let host_virt: HostVirtAddr<_> = phys_unencrypted.into();
-
-        block.msg.req = request!(libc::SYS_clock_gettime => clk_id, host_virt);
-        let result = unsafe { host_call.hostcall() }.map(|r| r[0].into())?;
-
-        let block = host_call.as_mut_block();
-        let c = block.cursor();
-        let (_, untrusted) = unsafe { c.alloc::<libc::timespec>(1).or(Err(libc::EMSGSIZE))? };
-        unsafe {
-            trusted.write_volatile(untrusted[0]);
-        }
-
-        Ok(result)
-    }
-
-    pub fn uname(&self) -> Result<usize, libc::c_int> {
-        // Faked, because we cannot promise any features provided by Linux in the future.
-        eprintln!(
-            r##"SC> uname({{sysname="Linux", nodename="enarx", release="5.4.8", version="1", machine="x86_64", domainname="(none)"}}) = 0"##
-        );
-
-        let mut uts = unsafe { MaybeUninit::<libc::utsname>::zeroed().assume_init() };
-        uts.sysname[..5].copy_from_slice(TrySigned::try_signed(b"Linux").unwrap());
-        uts.nodename[..5].copy_from_slice(TrySigned::try_signed(b"enarx").unwrap());
-        uts.release[..5].copy_from_slice(TrySigned::try_signed(b"5.4.8").unwrap());
-        uts.version[..6].copy_from_slice(TrySigned::try_signed(b"#1 SMP").unwrap());
-        uts.machine[..6].copy_from_slice(TrySigned::try_signed(b"x86_64").unwrap());
-        unsafe {
-            (self.a as *mut libc::utsname).write_volatile(uts);
-        }
-        Ok(0)
-    }
-
-    pub fn readlink(&self) -> Result<usize, libc::c_int> {
-        // Fake readlink("/proc/self/exe")
-        const PROC_SELF_EXE: &str = "/proc/self/exe";
-
-        let pathname = unsafe {
-            let mut len: isize = 0;
-            let ptr: *const u8 = self.a as _;
-            loop {
-                if ptr.offset(len).read() == 0 {
-                    break;
-                }
-                len = len.checked_add(1).unwrap();
-                if len as usize >= PROC_SELF_EXE.len() {
-                    break;
-                }
-            }
-            core::str::from_utf8_unchecked(core::slice::from_raw_parts(self.a as _, len as _))
-        };
-
-        if !pathname.eq(PROC_SELF_EXE) {
-            return Err(libc::ENOENT);
-        }
-
-        let outbuf = unsafe { core::slice::from_raw_parts_mut(self.b as _, self.c as _) };
-        outbuf[..6].copy_from_slice(b"/init\0");
-        eprintln!("SC> readlink({:#?}, \"/init\", {}) = 5", pathname, self.c);
-        Ok(5)
-    }
-
-    pub fn fstat(&self) -> Result<usize, libc::c_int> {
-        // Fake fstat(0|1|2, ...) done by glibc or rust
-        match self.a as i32 {
-            libc::STDIN_FILENO | libc::STDOUT_FILENO | libc::STDERR_FILENO => {
-                #[allow(clippy::integer_arithmetic)]
-                const fn makedev(x: u64, y: u64) -> u64 {
-                    (((x) & 0xffff_f000u64) << 32)
-                        | (((x) & 0x0000_0fffu64) << 8)
-                        | (((y) & 0xffff_ff00u64) << 12)
-                        | ((y) & 0x0000_00ffu64)
-                }
-
-                let mut p = unsafe { MaybeUninit::<libc::stat>::zeroed().assume_init() };
-
-                p.st_dev = makedev(
-                    0,
-                    match self.a {
-                        0 => 0x19,
-                        _ => 0xc,
-                    },
-                );
-                p.st_ino = 3;
-                p.st_mode = libc::S_IFIFO | 0o600;
-                p.st_nlink = 1;
-                p.st_uid = 1000;
-                p.st_gid = 5;
-                p.st_blksize = 4096;
-                p.st_blocks = 0;
-                p.st_rdev = makedev(0x88, 0);
-                p.st_size = 0;
-
-                p.st_atime = 1_579_507_218 /* 2020-01-21T11:45:08.467721685+0100 */;
-                p.st_atime_nsec = 0;
-                p.st_mtime = 1_579_507_218 /* 2020-01-21T11:45:07.467721685+0100 */;
-                p.st_mtime_nsec = 0;
-                p.st_ctime = 1_579_507_218 /* 2020-01-20T09:00:18.467721685+0100 */;
-                p.st_ctime_nsec = 0;
-
-                unsafe {
-                    (self.b as *mut libc::stat).write_volatile(p);
-                }
-
-                eprintln!("SC> fstat({}, {{st_dev=makedev(0, 0x19), st_ino=3, st_mode=S_IFIFO|0600,\
-                 st_nlink=1, st_uid=1000, st_gid=5, st_blksize=4096, st_blocks=0, st_size=0,\
-                  st_rdev=makedev(0x88, 0), st_atime=1579507218 /* 2020-01-21T11:45:08.467721685+0100 */,\
-                   st_atime_nsec=0, st_mtime=1579507218 /* 2020-01-21T11:45:08.467721685+0100 */,\
-                    st_mtime_nsec=0, st_ctime=1579507218 /* 2020-01-21T11:45:08.467721685+0100 */,\
-                     st_ctime_nsec=0}}) = 0", self.a);
-                Ok(0)
-            }
-            _ => Err(libc::EBADF),
-        }
-    }
-
-    pub fn fcntl(&self) -> Result<usize, libc::c_int> {
-        match (self.a as i32, self.b as i32) {
-            (libc::STDIN_FILENO, libc::F_GETFL) => {
-                eprintln!(
-                    "SC> fcntl({}, F_GETFD) = 0x402 (flags O_RDWR|O_APPEND)",
-                    self.a
-                );
-                Ok((libc::O_RDWR | libc::O_APPEND) as _)
-            }
-            (libc::STDOUT_FILENO, libc::F_GETFL) | (libc::STDERR_FILENO, libc::F_GETFL) => {
-                eprintln!("SC> fcntl({}, F_GETFD) = 0x1 (flags O_WRONLY)", self.a);
-                Ok(libc::O_WRONLY as _)
-            }
-            (libc::STDIN_FILENO, _) | (libc::STDOUT_FILENO, _) | (libc::STDERR_FILENO, _) => {
-                eprintln!("SC> fcntl({}, {}) = -EINVAL", self.a, self.b);
-                Err(libc::EINVAL)
-            }
-            (_, _) => {
-                eprintln!("SC> fcntl({}, {}) = -EBADFD", self.a, self.b);
-                Err(libc::EBADFD)
-            }
-        }
-    }
-
-    pub fn madvise(&self) -> Result<usize, libc::c_int> {
-        eprintln!(
-            "SC> madvise(0x{:x}, 0x{:x}, 0x{:x}) = 0",
-            self.a, self.b, self.c
-        );
-
-        Ok(0)
-    }
-
-    pub fn poll(&self) -> Result<usize, libc::c_int> {
-        let nfds = self.b as libc::nfds_t;
-        let timeout = self.c as libc::c_int;
-        let trusted =
-            unsafe { core::slice::from_raw_parts_mut(self.a as *mut libc::pollfd, nfds as _) };
-
-        eprintln!("SC> poll(…) =  …");
-
-        let mut host_call = HOST_CALL.try_lock().ok_or(libc::EIO)?;
-
-        let block = host_call.as_mut_block();
-
-        let c = block.cursor();
-        let (_, buf) = unsafe { c.alloc::<libc::pollfd>(nfds as _).or(Err(libc::EMSGSIZE))? };
-        buf.copy_from_slice(trusted);
-
-        let buf_address = Address::from(&buf[0]);
-        let phys_unencrypted = ShimPhysUnencryptedAddr::try_from(buf_address).unwrap();
-        let host_virt = HostVirtAddr::from(phys_unencrypted);
-
-        block.msg.req = request!(libc::SYS_poll => host_virt, nfds, timeout);
-        let result = unsafe { host_call.hostcall() }.map(|r| r[0].into())?;
-
-        let block = host_call.as_mut_block();
-        let c = block.cursor();
-        let (_, untrusted) = unsafe { c.alloc::<libc::pollfd>(nfds as _).or(Err(libc::EMSGSIZE))? };
-        trusted.copy_from_slice(untrusted);
-
-        Ok(result)
-    }
-}
-
-/// Convert an unsigned slice to a signed slice
-pub trait TrySigned<T>: Sized {
-    /// The type returned in the event of a conversion error.
-    type Error;
-
-    /// Performs the conversion.
-    fn try_signed(value: &[T]) -> Result<Self, Self::Error>;
-}
-
-impl TrySigned<u8> for &[i8] {
-    type Error = core::num::TryFromIntError;
-
-    fn try_signed(value: &[u8]) -> Result<Self, Self::Error> {
-        for c in value {
-            i8::try_from(*c)?;
-        }
-
-        let len = value.len();
-        let ptr = value.as_ptr() as *const i8;
-
-        Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
+    fn madvise(
+        &mut self,
+        _addr: *const libc::c_void,
+        _length: usize,
+        _advice: i32,
+    ) -> sallyport::Result {
+        self.trace("madvise", 3);
+        Ok(Default::default())
     }
 }

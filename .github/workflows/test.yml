@@ -62,6 +62,8 @@ jobs:
           - rcrt1
           - sgx-heap
           - sallyport
+          - untrusted
+          - syscall
           - shim-sgx
           - shim-sev
         profile:
