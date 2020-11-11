@@ -96,17 +96,6 @@ fn msb(val: usize) -> usize {
     }
 }
 
-/// Error returned by the `FrameAllocator`
-#[derive(Debug)]
-pub enum AllocateError {
-    /// Memory or Size not page aligned
-    NotAligned,
-    /// Out of Memory
-    OutOfMemory,
-    /// Requested memory size of zero
-    ZeroSize,
-}
-
 impl FrameAllocator {
     #[allow(clippy::integer_arithmetic)]
     unsafe fn new() -> Self {
@@ -225,7 +214,7 @@ impl FrameAllocator {
         }
     }
 
-    fn balloon(&mut self, addr: usize) -> Result<(), AllocateError> {
+    fn balloon(&mut self, addr: usize) -> Result<(), ()> {
         let mut free = &mut self.free_mem;
         let mut last_end: usize = 0;
         let mut last_size: usize = self.min_alloc;
@@ -250,13 +239,13 @@ impl FrameAllocator {
                         last_size = last_size.checked_div(2).unwrap();
                         if last_size < Page4KiB::size() {
                             // Host does not have even a page of memory
-                            return Err(AllocateError::OutOfMemory);
+                            return Err(());
                         }
                     }
                 }
                 if i.start > addr {
                     // should never happen
-                    return Err(AllocateError::OutOfMemory);
+                    return Err(());
                 }
                 if i.end > addr {
                     // this slot has enough room
@@ -270,7 +259,7 @@ impl FrameAllocator {
             // we have reached the end of the free slot page
             // advance to the next page
             match free.header.next.as_deref_mut() {
-                None => return Err(AllocateError::OutOfMemory),
+                None => return Err(()),
                 Some(f) => free = f,
             }
         }
@@ -283,14 +272,14 @@ impl FrameAllocator {
         mapper: &mut impl Mapper<S>,
         flags: PageTableFlags,
         parent_flags: PageTableFlags,
-    ) -> Result<(), AllocateError> {
+    ) -> Result<(), ()> {
         if map_to.is_empty() {
             return Ok(());
         }
         let size = map_to
             .len()
             .checked_mul(Page::<S>::SIZE as usize)
-            .ok_or(AllocateError::OutOfMemory)?;
+            .ok_or(())?;
 
         let page_range = {
             let start = VirtAddr::from_ptr(map_to.as_ptr());
@@ -301,14 +290,12 @@ impl FrameAllocator {
         };
 
         for page in page_range {
-            let frame = frame_allocator
-                .allocate_frame()
-                .ok_or(AllocateError::OutOfMemory)?;
+            let frame = frame_allocator.allocate_frame().ok_or(())?;
 
             unsafe {
                 mapper
                     .map_to_with_table_flags(page, frame, flags, parent_flags, frame_allocator)
-                    .map_err(|_| AllocateError::OutOfMemory)?
+                    .map_err(|_| ())?
                     .flush();
             }
         }
@@ -323,24 +310,23 @@ impl FrameAllocator {
         size: usize,
         flags: PageTableFlags,
         parent_flags: PageTableFlags,
-    ) -> Result<&'static mut [u8], AllocateError> {
+    ) -> Result<&'static mut [u8], ()> {
         if size == 0 {
-            return Err(AllocateError::ZeroSize);
+            return Err(());
         }
 
         if !map_to.is_aligned(Page::<Size4KiB>::SIZE) {
-            return Err(AllocateError::NotAligned);
+            return Err(());
         }
 
         if size != align_down(size as _, Page::<Size4KiB>::SIZE) as usize {
-            return Err(AllocateError::NotAligned);
+            return Err(());
         }
 
         let slice = unsafe {
             core::slice::from_raw_parts_mut(
                 map_to.as_mut_ptr::<Page4KiB>(),
-                size.checked_div(Page4KiB::size())
-                    .ok_or(AllocateError::NotAligned)?,
+                size.checked_div(Page4KiB::size()).ok_or(())?,
             )
         };
 
@@ -378,9 +364,9 @@ impl FrameAllocator {
         size: usize,
         flags: PageTableFlags,
         parent_flags: PageTableFlags,
-    ) -> Result<(), AllocateError> {
+    ) -> Result<(), ()> {
         if size == 0 {
-            return Err(AllocateError::ZeroSize);
+            return Err(());
         }
 
         let frame_range_from = {
@@ -403,7 +389,7 @@ impl FrameAllocator {
             unsafe {
                 mapper
                     .map_to_with_table_flags(page_to, frame_from, flags, parent_flags, self)
-                    .map_err(|_| AllocateError::OutOfMemory)?
+                    .map_err(|_| ())?
                     .flush();
             }
         }

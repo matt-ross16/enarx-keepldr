@@ -11,8 +11,7 @@ use core::fmt;
 use spinning::OnceState;
 
 // FIXME: remove, if https://github.com/enarx/enarx/issues/831 is fleshed out
-/// Global flag allowing debug output.
-pub const TRACE: bool = false;
+const TRACE: bool = false;
 
 impl fmt::Write for HostWrite {
     #[inline(always)]
@@ -27,7 +26,7 @@ impl fmt::Write for HostWrite {
 pub fn _print(args: fmt::Arguments) {
     use fmt::Write;
 
-    if FRAME_ALLOCATOR.state().ne(&OnceState::Initialized) {
+    if !TRACE || FRAME_ALLOCATOR.state().ne(&OnceState::Initialized) {
         return;
     }
 
@@ -41,7 +40,7 @@ pub fn _print(args: fmt::Arguments) {
 pub fn _eprint(args: fmt::Arguments) {
     use fmt::Write;
 
-    if FRAME_ALLOCATOR.state().ne(&OnceState::Initialized) {
+    if !TRACE || FRAME_ALLOCATOR.state().ne(&OnceState::Initialized) {
         return;
     }
 
@@ -63,7 +62,7 @@ pub fn _eprint(args: fmt::Arguments) {
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {
-       if $crate::print::TRACE { $crate::print::_print(format_args!($($arg)*)); }
+        $crate::print::_print(format_args!($($arg)*));
     };
 }
 
@@ -103,7 +102,7 @@ macro_rules! println {
 #[macro_export]
 macro_rules! eprint {
     ($($arg:tt)*) => {
-        if $crate::print::TRACE { $crate::print::_eprint(format_args!($($arg)*)) };
+        $crate::print::_eprint(format_args!($($arg)*));
     };
 }
 

@@ -4,5 +4,4 @@ rustflags = [
     "-C", "relocation-model=pic",
     "-C", "link-args=-Wl,--sort-section=alignment -nostartfiles",
     "-C", "link-self-contained=no",
-    "-C", "force-frame-pointers=yes",
 ]

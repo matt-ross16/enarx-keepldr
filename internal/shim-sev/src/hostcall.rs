@@ -8,6 +8,7 @@ use crate::hostlib::{MemInfo, SYSCALL_TRIGGER_PORT, SYS_ENARX_BALLOON_MEMORY, SY
 use crate::lazy::Lazy;
 use crate::SHIM_HOSTCALL_VIRT_ADDR;
 use core::convert::TryFrom;
+use core::mem::MaybeUninit;
 use primordial::{Address, Register};
 use sallyport::{request, Block};
 use spinning::Mutex;
@@ -68,15 +69,7 @@ impl<'a> HostCall<'a> {
     #[inline(always)]
     pub unsafe fn hostcall(&mut self) -> sallyport::Result {
         let mut port = Port::<u16>::new(SYSCALL_TRIGGER_PORT);
-
-        // prevent earlier writes from being moved beyond this point
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-
         port.write(1);
-
-        // prevent later reads from being moved before this point
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-
         self.0.msg.rep.into()
     }
 
@@ -98,9 +91,9 @@ impl<'a> HostCall<'a> {
     /// # Safety
     ///
     /// The parameters returned can't be trusted.
-    pub unsafe fn write(&mut self, fd: libc::c_int, bytes: &[u8]) -> sallyport::Result {
+    pub unsafe fn write(&mut self, fd: usize, bytes: &[u8]) -> sallyport::Result {
         let cursor = self.0.cursor();
-        let (_, buf) = cursor.copy_from_slice(bytes).or(Err(libc::EMSGSIZE))?;
+        let (_, buf) = cursor.copy_slice(bytes).or(Err(libc::EMSGSIZE))?;
 
         let buf_address = Address::from(buf.as_ptr());
         let phys_unencrypted = ShimPhysUnencryptedAddr::try_from(buf_address).unwrap();
@@ -118,16 +111,19 @@ impl<'a> HostCall<'a> {
 
     /// Get host memory info
     pub fn mem_info(&mut self) -> Result<MemInfo, libc::c_int> {
+        let mut mem_info = MaybeUninit::<MemInfo>::uninit();
+
         self.0.msg.req = request!(SYS_ENARX_MEM_INFO);
 
         let _result = unsafe { self.hostcall() }?;
 
         let block = self.as_mut_block();
         let c = block.cursor();
-
-        let (_, mem_info) = unsafe { c.read::<MemInfo>() }.or(Err(libc::EMSGSIZE))?;
-
-        Ok(mem_info)
+        let (_, untrusted) = unsafe { c.alloc::<MemInfo>(1).or(Err(libc::EMSGSIZE))? };
+        unsafe {
+            mem_info.as_mut_ptr().write_volatile(untrusted[0]);
+            Ok(mem_info.assume_init())
+        }
     }
 
     /// Exit the shim with a `status` code
@@ -136,7 +132,7 @@ impl<'a> HostCall<'a> {
     ///
     /// Panics, if the shim resumes to run.
     #[inline(always)]
-    pub fn exit_group(&mut self, status: i32) -> ! {
+    pub fn exit_group(&mut self, status: u32) -> ! {
         unsafe {
             let request = request!(libc::SYS_exit_group => status);
             self.0.msg.req = request;
@@ -151,6 +147,7 @@ impl<'a> HostCall<'a> {
 /// Write all `bytes` to a host file descriptor `fd`
 #[inline(always)]
 pub fn shim_write_all(fd: HostFd, bytes: &[u8]) -> Result<(), libc::c_int> {
+    let fd = usize::try_from(fd.as_raw_fd()).map_err(|_| libc::EBADF)?;
     let bytes_len = bytes.len();
     let mut to_write = bytes_len;
 
@@ -160,7 +157,7 @@ pub fn shim_write_all(fd: HostFd, bytes: &[u8]) -> Result<(), libc::c_int> {
         let written = unsafe {
             let next = bytes_len.checked_sub(to_write).ok_or(libc::EFAULT)?;
             host_call
-                .write(fd.as_raw_fd(), &bytes[next..])
+                .write(fd, &bytes[next..])
                 .map(|regs| usize::from(regs[0]))
         }?;
         // be careful with `written` as it is untrusted
@@ -177,7 +174,7 @@ pub fn shim_write_all(fd: HostFd, bytes: &[u8]) -> Result<(), libc::c_int> {
 ///
 /// Reverts to a triple fault, which causes a `#VMEXIT` and a KVM shutdown,
 /// if it cannot talk to the host.
-pub fn shim_exit(status: i32) -> ! {
+pub fn shim_exit(status: u32) -> ! {
     if let Some(mut host_call) = HOST_CALL.try_lock() {
         host_call.exit_group(status)
     }

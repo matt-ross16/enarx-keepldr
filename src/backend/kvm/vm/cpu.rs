@@ -123,8 +123,12 @@ impl Thread for Cpu {
                             };
 
                             let c = sallyport.cursor();
-                            c.write(&mem_info)
-                                .map_err(|_| anyhow!("Failed to allocate MemInfo in Block"))?;
+                            let (_, buf) = unsafe {
+                                c.alloc::<MemInfo>(1)
+                                    .map_err(|_| anyhow!("Failed to allocate MemInfo in Block"))?
+                            };
+
+                            buf[0] = mem_info;
 
                             let ok_result: [Register<usize>; 2] = [0.into(), 0.into()];
 
@@ -142,7 +146,7 @@ impl Thread for Cpu {
                 if cfg!(debug_assertions) {
                     Err(anyhow!("{:?} {:#x?}", exit_reason, self.fd.get_regs()))
                 } else {
-                    Err(anyhow!("{:?}", exit_reason))
+                    Err(anyhow!("{:?}"))
                 }
             }
         }
