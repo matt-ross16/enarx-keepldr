@@ -48,6 +48,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-    name: enarxbot
+    name: enarxbot for enarx-keeldr
     steps:
       - uses: enarx/bot@master
